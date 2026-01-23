@@ -1,0 +1,38 @@
+# PDFフォルダ
+PDF/
+
+# distフォルダ
+dist/
+
+# venv_kuroshachiフォルダ
+venv_kuroshachi/
+
+# Python関連
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# データベース
+*.db
+*.sqlite
+*.sqlite3
+
+# ログファイル
+*.log
+
+# ビルド関連
+build/
+*.spec.bak
+
+# IDE関連
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS関連
+.DS_Store
+Thumbs.db
