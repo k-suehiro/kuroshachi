@@ -49,7 +49,7 @@ except ImportError as e:
     logger.warning(f"tkinterwebがインストールされていません: {str(e)}")
 
 # アプリケーションのバージョン情報
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_NAME = "黒鯱"
 
 # リソースファイルのパスを取得する関数（EXE化時と通常実行時に対応）
@@ -571,13 +571,13 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
             inner_frame.columnconfigure(0, weight=0, minsize=90)
             inner_frame.columnconfigure(1, weight=1)
             
-            # ナビゲーションボタンを一番下に配置（上のマージンを大きく、センター揃え）
+            # ナビゲーションボタンを一番下に配置（上のマージンを小さく、センター揃え）
             if hasattr(self, 'nav_frame'):
                 # 既にpackされている場合は一度forgetしてから再配置
                 if self.nav_frame.winfo_manager() != '':
                     self.nav_frame.pack_forget()
-                # 上のマージンを大きく（100px）、下のマージンは5px、センター揃え
-                self.nav_frame.pack(side=tk.BOTTOM, pady=(200, 5), padx=5, anchor=tk.CENTER)
+                # 上のマージンを小さく（30px）、下のマージンは5px、センター揃え
+                self.nav_frame.pack(side=tk.BOTTOM, pady=(30, 5), padx=5, anchor=tk.CENTER)
                 
         except Exception as e:
             print(f"PDF情報の更新に失敗: {str(e)}")
@@ -1065,12 +1065,45 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
                         # まず、大文字小文字を区別せずに検索（これにより「Sen-sor」のようなハイフンを含む単語も見つかる）
                         all_instances = page.search_for(term, quads=True)
                         instances = []
-                        # 各インスタンスのテキストを取得して、大文字小文字を区別してフィルタリング
+                        # ページ全体のテキストブロックを取得（大文字小文字を区別した判定のため）
+                        blocks = page.get_text("dict")
+                        # 各インスタンスの位置を確認して、大文字小文字を区別してフィルタリング
                         for quads in all_instances:
                             try:
-                                # quadsの矩形内のテキストを取得
                                 rect = quads.rect
-                                text_in_rect = page.get_textbox(rect)
+                                # 矩形を少し拡張して、その範囲内のテキストを取得（誤差を考慮）
+                                expanded_rect = fitz.Rect(
+                                    max(0, rect.x0 - 2),
+                                    max(0, rect.y0 - 2),
+                                    min(page.rect.width, rect.x1 + 2),
+                                    min(page.rect.height, rect.y1 + 2)
+                                )
+                                # 拡張した矩形内のテキストを取得
+                                try:
+                                    text_in_rect = page.get_textbox(expanded_rect)
+                                except:
+                                    text_in_rect = ""
+                                
+                                # テキストが空の場合は、テキストブロックから取得
+                                if not text_in_rect:
+                                    # 矩形内のすべてのテキストスパンを集める（位置順にソート）
+                                    span_list = []
+                                    for block in blocks.get("blocks", []):
+                                        if "lines" not in block:
+                                            continue
+                                        for line in block["lines"]:
+                                            for span in line.get("spans", []):
+                                                span_text = span.get("text", "")
+                                                span_bbox = span.get("bbox", [])
+                                                # 矩形がquadsの矩形と重なっているか確認
+                                                if (len(span_bbox) == 4 and 
+                                                    span_bbox[0] <= rect.x1 and span_bbox[2] >= rect.x0 and
+                                                    span_bbox[1] <= rect.y1 and span_bbox[3] >= rect.y0):
+                                                    span_list.append((span_bbox[1], span_bbox[0], span_text))  # y座標、x座標、テキスト
+                                    # y座標、x座標の順でソートしてテキストを結合
+                                    span_list.sort(key=lambda x: (x[0], x[1]))
+                                    text_in_rect = "".join([s[2] for s in span_list])
+                                
                                 # 大文字小文字を区別して検索語が含まれているか確認
                                 if term in text_in_rect:
                                     instances.append(quads)
@@ -2155,14 +2188,34 @@ PDFファイルの全文検索ツール
         file_frame.pack(fill=tk.X, padx=5, pady=5)
         file_frame.pack_propagate(False)
         
+        # スクロールバー用のフレームを作成
+        tree_frame = ttk.Frame(file_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        
         # Treeviewはttkbootstrapで直接サポートされていないため、標準のttk.Treeviewを使用
         self.file_tree = ttk.Treeview(
-            file_frame, 
+            tree_frame, 
             columns=("path",),
             show="tree headings"
         )
         self.file_tree.heading("#0", text="ファイル名")
-        self.file_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # 縦スクロールバー
+        v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.file_tree.yview)
+        self.file_tree.configure(yscrollcommand=v_scrollbar.set)
+        
+        # 横スクロールバー
+        h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.file_tree.xview)
+        self.file_tree.configure(xscrollcommand=h_scrollbar.set)
+        
+        # 配置
+        self.file_tree.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+        
+        # グリッドの重み設定
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
         
         # 右クリックメニューの作成
         self.popup_menu = tk.Menu(self.file_tree, tearoff=0)
