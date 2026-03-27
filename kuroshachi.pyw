@@ -49,7 +49,7 @@ except ImportError as e:
     logger.warning(f"tkinterwebがインストールされていません: {str(e)}")
 
 # アプリケーションのバージョン情報
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 APP_NAME = "黒鯱"
 
 # リソースファイルのパスを取得する関数（EXE化時と通常実行時に対応）
@@ -322,6 +322,17 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         if HAS_TTKB:
             self.next_button.configure(bootstyle="secondary")
         self.next_button.pack(side=tk.LEFT, padx=2)
+
+        # 注釈表示ON/OFF
+        self.show_annots_var = tk.BooleanVar(value=True)
+        CheckbuttonClass = ttkb.Checkbutton if HAS_TTKB else ttk.Checkbutton
+        self.annots_toggle = CheckbuttonClass(
+            self.nav_frame,
+            text="注釈",
+            variable=self.show_annots_var,
+            command=self.toggle_annotations
+        )
+        self.annots_toggle.pack(side=tk.LEFT, padx=(6, 2))
         
         # コールバック関数（メインアプリケーションから設定）
         self.navigate_result_callback = None
@@ -370,6 +381,8 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         self.selected_text = ""
         self.text_highlights = []  # テキストハイライト用の矩形IDリスト
         self.text_blocks = []  # 現在のページのテキストブロック情報
+        self.search_highlights = []  # 検索ハイライト用の矩形IDリスト
+        self.search_highlight_rects = []  # 検索ハイライトの元PDF座標
         
         # 手のひらツール用の変数（右クリックドラッグ）
         self.image_id = None  # 画像のID
@@ -736,7 +749,10 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
                 283 / preview_page.rect.height
             )
             preview_matrix = fitz.Matrix(preview_zoom, preview_zoom)
-            preview_pix = preview_page.get_pixmap(matrix=preview_matrix)
+            preview_pix = preview_page.get_pixmap(
+                matrix=preview_matrix,
+                annots=self.show_annots_var.get()
+            )
             
             self.preview_photoimg = ImageTk.PhotoImage(
                 Image.frombytes("RGB", 
@@ -765,6 +781,20 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         """検索結果の次の項目に移動"""
         if self.navigate_result_callback:
             self.navigate_result_callback(1)  # 1は次へ
+
+    def toggle_annotations(self):
+        """注釈表示のON/OFFを切り替えて再描画"""
+        if self.doc is None or self.current_page is None:
+            return
+        case_sensitive = getattr(self, 'case_sensitive', False)
+        self.show_page(
+            self.current_page,
+            self.search_term,
+            fit_to_page=False,
+            is_phrase_search=self.is_phrase_search,
+            case_sensitive=case_sensitive
+        )
+        self.update_preview()
     
     def reset_view(self):
         """初期表示に戻る（拡大縮小をリセット）"""
@@ -978,6 +1008,7 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         # 画像の位置を更新
         if self.image_id:
             self.canvas.coords(self.image_id, self.image_x, self.image_y)
+            self.redraw_search_highlights()
     
     def end_pan(self, event):
         """手のひらツール終了（右クリック離す）"""
@@ -985,6 +1016,25 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         self.pan_start_y = None
         # カーソルを元に戻す
         self.canvas.config(cursor="")
+
+    def redraw_search_highlights(self):
+        """検索ハイライトを現在のズーム/位置で再描画"""
+        for highlight_id in self.search_highlights:
+            self.canvas.delete(highlight_id)
+        self.search_highlights = []
+
+        for rect in self.search_highlight_rects:
+            x0 = self.image_x + (rect.x0 * self.zoom)
+            y0 = self.image_y + (rect.y0 * self.zoom)
+            x1 = self.image_x + (rect.x1 * self.zoom)
+            y1 = self.image_y + (rect.y1 * self.zoom)
+            highlight_id = self.canvas.create_rectangle(
+                x0, y0, x1, y1,
+                fill="#fff176",
+                outline="",
+                stipple="gray50"
+            )
+            self.search_highlights.append(highlight_id)
     
     def show_page(self, page_num, search_term=None, fit_to_page=True, is_phrase_search=False, case_sensitive=False):
         if not self.doc:
@@ -1001,10 +1051,6 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
                 
             page = self.doc[page_num]
             self.current_page = page_num
-            
-            # 既存のハイライトを削除（拡大縮小時の重複を防ぐ）
-            for annot in page.annots():
-                page.delete_annot(annot)
             
             # ズャンバスのサイズを取得
             canvas_width = self.canvas.winfo_width()
@@ -1037,6 +1083,7 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
             ]
             
             # ページのテキストと位置情報を取得
+            self.search_highlight_rects = []
             if search_term:
                 # フレーズ検索モードの判定
                 # 引数で渡されたis_phrase_searchを使用、なければsearch_termから判定
@@ -1055,8 +1102,11 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
                     # AND検索：スペースで分割
                     search_terms = search_term.split()
                 
-                # マージのコピーを作成
-                pix = page.get_pixmap(matrix=zoom_matrix)
+                # 既存注釈はそのまま描画する
+                pix = page.get_pixmap(
+                    matrix=zoom_matrix,
+                    annots=self.show_annots_var.get()
+                )
                 
                 # 各検索語に対して異なる色でハイライト
                 for i, term in enumerate(search_terms):
@@ -1127,25 +1177,16 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
                                         not math.isnan(rect.x1) and not math.isnan(rect.y1) and
                                         not math.isinf(rect.x0) and not math.isinf(rect.y0) and
                                         not math.isinf(rect.x1) and not math.isinf(rect.y1)):
-                                        annot = page.add_highlight_annot(quads)
-                                        if i > 0:  # 2つ目以降の単語
-                                            color_index = min(i, len(highlight_colors) - 1)
-                                            if highlight_colors[color_index]:
-                                                annot.set_colors(stroke=highlight_colors[color_index])
-                                                annot.update()
+                                        self.search_highlight_rects.append(rect)
                             except Exception as e:
                                 # エラーが発生した場合はスキップ
                                 logger.debug(f"ハイライト作成エラー: {str(e)}")
                                 continue
-                
-                # ハイライト付きのページを表示
-                pix = page.get_pixmap(matrix=zoom_matrix)
-                
-                # ハイライトを削除（次回の表示のため）
-                for annot in page.annots():
-                    page.delete_annot(annot)
             else:
-                pix = page.get_pixmap(matrix=zoom_matrix)
+                pix = page.get_pixmap(
+                    matrix=zoom_matrix,
+                    annots=self.show_annots_var.get()
+                )
             
             # PhotoImageに変換
             self.photoimg = ImageTk.PhotoImage(
@@ -1177,6 +1218,9 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
             self.selected_text = ""
             self.start_x = None
             self.start_y = None
+
+            # 検索ハイライトを重ね描画（既存注釈はPDF本体描画に含まれる）
+            self.redraw_search_highlights()
             
         except Exception as e:
             messagebox.showerror("エラー", f"ページの表示に失敗: {str(e)}")
@@ -2315,14 +2359,16 @@ PDFファイルの全文検索ツール
         # テーマは自動的に適用されます
         self.result_tree = ttk.Treeview(
             result_frame,
-            columns=("filename", "page"),  # ファイル名、ページの2列
+            columns=("filename", "page", "context"),  # ファイル名、ページ、抜粋の3列
             show="headings"
         )
         self.result_tree.heading("filename", text="ファイル名")
         self.result_tree.heading("page", text="ページ")
-        # 列の比率: ファイル名:ページ
+        self.result_tree.heading("context", text="抜粋")
+        # 列の比率: ファイル名:ページ:抜粋
         self.result_tree.column("filename", width=0, stretch=True, minwidth=100)
         self.result_tree.column("page", width=45, stretch=False, minwidth=45)     # 固定幅
+        self.result_tree.column("context", width=260, stretch=True, minwidth=180)
         
         if HAS_TTKB:
             scrollbar = ttkb.Scrollbar(result_frame, orient=tk.VERTICAL, bootstyle="round")
@@ -2335,9 +2381,10 @@ PDFファイルの全文検索ツール
         scrollbar.configure(command=self.result_tree.yview)
         
         # 列の相対的な重みを設定
-        # 比率: ファイル名:ページ = 3:1
-        result_frame.columnconfigure(0, weight=3)   # filename列
+        # 比率: ファイル名:ページ:抜粋 = 2:1:5
+        result_frame.columnconfigure(0, weight=2)   # filename列
         result_frame.columnconfigure(1, weight=1)   # page列
+        result_frame.columnconfigure(2, weight=5)   # context列
         
         # 検索結果選択時のイベント
         self.result_tree.bind("<<TreeviewSelect>>", self.on_result_select)
@@ -2871,7 +2918,7 @@ PDFファイルの全文検索ツール
                     
                     self.result_tree.insert(
                         "", "end",
-                        values=(filename, page + 1),
+                        values=(filename, page + 1, context_highlighted),
                         tags=(filepath, str(page))
                     )
 
