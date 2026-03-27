@@ -49,7 +49,7 @@ except ImportError as e:
     logger.warning(f"tkinterwebがインストールされていません: {str(e)}")
 
 # アプリケーションのバージョン情報
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_NAME = "黒鯱"
 
 # リソースファイルのパスを取得する関数（EXE化時と通常実行時に対応）
@@ -382,7 +382,9 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         self.text_highlights = []  # テキストハイライト用の矩形IDリスト
         self.text_blocks = []  # 現在のページのテキストブロック情報
         self.search_highlights = []  # 検索ハイライト用の矩形IDリスト
-        self.search_highlight_rects = []  # 検索ハイライトの元PDF座標
+        # search_for / get_text の矩形は「未回転のページ座標」。get_pixmap は回転後の見た目で描画するため、
+        # 重ね描画時は Page.rotation_matrix で回転表示座標へ変換する。
+        self.search_highlight_rects = []  # 検索ハイライトの元矩形（未回転ページ座標）
         
         # 手のひらツール用の変数（右クリックドラッグ）
         self.image_id = None  # 画像のID
@@ -872,15 +874,12 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
             image_x = self.image_x if self.image_id else 0
             image_y = self.image_y if self.image_id else 0
             
-            # 座標をPDF座標系に変換
-            # キャンバス座標から画像の左上隅を引いて、ズーム倍率で割る
-            start_point = (
-                (self.start_x - image_x) / self.zoom,
-                (self.start_y - image_y) / self.zoom
+            # キャンバス座標 → 表示画像上のピクセル → 未回転ページ座標（横向き等の /Rotate に対応）
+            start_point = self._pixmap_point_to_unrotated_page(
+                page, self.start_x - image_x, self.start_y - image_y
             )
-            end_point = (
-                (cur_x - image_x) / self.zoom,
-                (cur_y - image_y) / self.zoom
+            end_point = self._pixmap_point_to_unrotated_page(
+                page, cur_x - image_x, cur_y - image_y
             )
             
             # 選択範囲のテキストを取得
@@ -892,7 +891,7 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
             self.selected_text = page.get_text("text", clip=rect)
             
             # テキストブロックの位置情報を取得してハイライト表示
-            self.highlight_text_blocks(start_point, end_point, image_x, image_y)
+            self.highlight_text_blocks(start_point, end_point, image_x, image_y, page)
     
     def end_select(self, event):
         """選択終了"""
@@ -907,13 +906,14 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
             self.clipboard_clear()
             self.clipboard_append(self.selected_text)
     
-    def highlight_text_blocks(self, start_point, end_point, image_x, image_y):
+    def highlight_text_blocks(self, start_point, end_point, image_x, image_y, page=None):
         """選択範囲内のテキストブロックをハイライト表示"""
         if not self.doc or self.current_page is None:
             return
+        if page is None:
+            page = self.doc[self.current_page]
         
         try:
-            page = self.doc[self.current_page]
             
             # テキストブロックの位置情報を取得
             text_dict = page.get_text("dict")
@@ -943,11 +943,12 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
                         
                         # 選択範囲とテキストブロックが重なっているかチェック
                         if self.rects_intersect(select_rect, text_rect):
-                            # キャンバス座標に変換
-                            x1 = image_x + text_rect[0] * self.zoom
-                            y1 = image_y + text_rect[1] * self.zoom
-                            x2 = image_x + text_rect[2] * self.zoom
-                            y2 = image_y + text_rect[3] * self.zoom
+                            # 未回転ページ座標 → 表示画像座標（横向きページの /Rotate に対応）
+                            r = fitz.Rect(text_rect[0], text_rect[1], text_rect[2], text_rect[3]) * self._page_view_matrix(page)
+                            x1 = image_x + r.x0
+                            y1 = image_y + r.y0
+                            x2 = image_x + r.x1
+                            y2 = image_y + r.y1
                             
                             # ハイライト矩形を描画（黄色の半透明）
                             highlight_id = self.canvas.create_rectangle(
@@ -1017,17 +1018,33 @@ class PDFViewerFrame(ttkb.Frame if HAS_TTKB else ttk.Frame):
         # カーソルを元に戻す
         self.canvas.config(cursor="")
 
+    def _page_view_matrix(self, page):
+        """未回転ページ座標 → ピクスマップ（表示画像）座標への変換行列"""
+        return page.rotation_matrix * fitz.Matrix(self.zoom, self.zoom)
+
+    def _pixmap_point_to_unrotated_page(self, page, px, py):
+        """表示画像上のピクセル座標（左上原点）を未回転ページ座標の点へ変換"""
+        mat = self._page_view_matrix(page)
+        inv = ~mat
+        pt = fitz.Point(px, py) * inv
+        return pt.x, pt.y
+
     def redraw_search_highlights(self):
         """検索ハイライトを現在のズーム/位置で再描画"""
         for highlight_id in self.search_highlights:
             self.canvas.delete(highlight_id)
         self.search_highlights = []
 
+        if not self.doc or self.current_page is None:
+            return
+        page = self.doc[self.current_page]
+
         for rect in self.search_highlight_rects:
-            x0 = self.image_x + (rect.x0 * self.zoom)
-            y0 = self.image_y + (rect.y0 * self.zoom)
-            x1 = self.image_x + (rect.x1 * self.zoom)
-            y1 = self.image_y + (rect.y1 * self.zoom)
+            r = rect * self._page_view_matrix(page)
+            x0 = self.image_x + r.x0
+            y0 = self.image_y + r.y0
+            x1 = self.image_x + r.x1
+            y1 = self.image_y + r.y1
             highlight_id = self.canvas.create_rectangle(
                 x0, y0, x1, y1,
                 fill="#fff176",
